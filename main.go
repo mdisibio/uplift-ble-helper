@@ -5,10 +5,12 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"tinygo.org/x/bluetooth"
 )
 
@@ -60,18 +62,28 @@ type desk struct {
 	preset4 float32
 }
 
+func (d *desk) setHeight(inches float32) {
+	meters := inches * 0.0254
+	d.height = inches
+
+	metricsDeskHeight.WithLabelValues(d.address.String()).Set(float64(inches))
+	metricsDeskHeightMeters.WithLabelValues(d.address.String()).Set(float64(meters))
+}
+
 type config struct {
 	scan          bool
 	deviceAddress string
 	preset1Time   time.Duration
 	preset2Time   time.Duration
+	port          int
 }
 
 func (c *config) registerFlagsAndApplyDefaults() {
 	flag.BoolVar(&c.scan, "scan", false, "Scan and print nearby devices")
 	flag.StringVar(&c.deviceAddress, "device", "", "Chosen device address")
-	flag.DurationVar(&c.preset1Time, "preset1", 30*time.Minute, "Time to stay in preset1 position")
-	flag.DurationVar(&c.preset2Time, "preset2", 30*time.Minute, "Time to stay in preset2 position")
+	flag.DurationVar(&c.preset1Time, "preset1", 0, "Time to stay in preset1 position")
+	flag.DurationVar(&c.preset2Time, "preset2", 0, "Time to stay in preset2 position")
+	flag.IntVar(&c.port, "port", 0, "Port to serve http metrics and api")
 }
 
 func main() {
@@ -115,7 +127,20 @@ func main() {
 	fmt.Println("  Preset 3      ", desk.preset3, "in")
 	fmt.Println("  Preset 4      ", desk.preset4, "in")
 
-	listenAndControl(desk, c)
+	if c.port > 0 {
+		http.Handle("/metrics", promhttp.Handler())
+		addr := fmt.Sprintf(":%d", c.port)
+		fmt.Println("Serving http at", addr)
+		go func() {
+			http.ListenAndServe(addr, nil)
+		}()
+	}
+
+	if c.preset1Time > 0 && c.preset2Time > 0 {
+		auto(desk, c)
+	}
+
+	cli(desk, c)
 }
 
 func scan() error {
@@ -200,25 +225,19 @@ func connect(address bluetooth.Address) (*desk, error) {
 	return desk, nil
 }
 
-func listenAndControl(desk *desk, c *config) error {
-	var (
-		stdin        = readStdIn()
-		dur, nextDur = c.preset1Time, c.preset2Time
-		t            = time.NewTimer(dur)
-	)
+func auto(desk *desk, c *config) {
+	go func() {
+		var (
+			dur     = c.preset1Time
+			nextDur = c.preset2Time
+			t       = time.NewTimer(dur)
+		)
 
-	fmt.Println("Going to preset 1 for", dur)
-	desk.command.WriteWithoutResponse(commandGoToPreset1)
+		fmt.Println("Enabling auto desk control.")
+		fmt.Println("Going to preset 1 for", dur)
+		desk.command.WriteWithoutResponse(commandGoToPreset1)
 
-	fmt.Println("Press ctrl+c to exit or enter command and press enter:")
-	fmt.Println("Commands:")
-	fmt.Println("  1 - go to preset 1")
-	fmt.Println("  2 - go to preset 2")
-	fmt.Println("  r - raise the desk a bit")
-	fmt.Println("  l - lower the desk a bit")
-	for {
-		select {
-		case <-t.C:
+		for range t.C {
 			switch dur {
 			case c.preset1Time:
 				fmt.Println("Going to preset 2 for", nextDur)
@@ -229,38 +248,50 @@ func listenAndControl(desk *desk, c *config) error {
 			}
 			dur, nextDur = nextDur, dur
 			t.Reset(dur)
+		}
+	}()
+}
 
-		case command := <-stdin:
-			switch command {
-			case "1":
-				desk.command.WriteWithoutResponse(commandGoToPreset1)
-			case "2":
-				desk.command.WriteWithoutResponse(commandGoToPreset2)
-			case "r":
-				desk.command.WriteWithoutResponse(commandRaise)
-			case "l":
-				desk.command.WriteWithoutResponse(commandLower)
-			default:
-				// Enter raw commands in the form of comma-delimited decimal notations
-				// 241,241,5,0,5,126
-				ints := strings.Split(command, ",")
-				bytes := []byte{}
-				var err error
-				var ii int64
-				for _, i := range ints {
-					ii, err = strconv.ParseInt(i, 0, 16)
-					if err != nil {
-						fmt.Println(err)
-						break
-					}
-					bytes = append(bytes, byte(ii))
-				}
+func cli(desk *desk, c *config) {
+	stdin := readStdIn()
+
+	fmt.Println("Press ctrl+c to exit or enter command and press enter:")
+	fmt.Println("Commands:")
+	fmt.Println("  1 - go to preset 1")
+	fmt.Println("  2 - go to preset 2")
+	fmt.Println("  r - raise the desk a bit")
+	fmt.Println("  l - lower the desk a bit")
+
+	for command := range stdin {
+		switch command {
+		case "1":
+			desk.command.WriteWithoutResponse(commandGoToPreset1)
+		case "2":
+			desk.command.WriteWithoutResponse(commandGoToPreset2)
+		case "r":
+			desk.command.WriteWithoutResponse(commandRaise)
+		case "l":
+			desk.command.WriteWithoutResponse(commandLower)
+		default:
+			// Enter raw commands in the form of comma-delimited decimal notations
+			// 241,241,5,0,5,126
+			ints := strings.Split(command, ",")
+			bytes := []byte{}
+			var err error
+			var ii int64
+			for _, i := range ints {
+				ii, err = strconv.ParseInt(i, 0, 16)
 				if err != nil {
+					fmt.Println(err)
 					break
 				}
-				fmt.Println("Sending raw command:", bytes)
-				desk.command.WriteWithoutResponse(bytes)
+				bytes = append(bytes, byte(ii))
 			}
+			if err != nil {
+				break
+			}
+			fmt.Println("Sending raw command:", bytes)
+			desk.command.WriteWithoutResponse(bytes)
 		}
 	}
 }
@@ -318,7 +349,7 @@ func handleResponse(buf []byte, desk *desk) (wasHeightChange bool) {
 		if len(params) >= 2 {
 			h := decodeHeight(params)
 			changed := desk.height != 0 && desk.height != h // Ignore first time
-			desk.height = h
+			desk.setHeight(h)
 			return changed
 		}
 	case 37:
