@@ -71,21 +71,25 @@ func (d *desk) setHeight(inches float32) {
 }
 
 type config struct {
-	scan          bool
-	deviceAddress string
-	preset1Time   time.Duration
-	preset2Time   time.Duration
-	port          int
-	detectDisplay bool
+	scan                bool
+	deviceAddress       string
+	auto                bool
+	preset1Time         time.Duration
+	preset2Time         time.Duration
+	port                int
+	detectDisplay       bool
+	detectExternalPower bool
 }
 
 func (c *config) registerFlagsAndApplyDefaults() {
 	flag.BoolVar(&c.scan, "scan", false, "Scan and print nearby devices")
-	flag.StringVar(&c.deviceAddress, "device", "", "Chosen device address")
-	flag.DurationVar(&c.preset1Time, "preset1", 0, "Time to stay in preset1 position")
-	flag.DurationVar(&c.preset2Time, "preset2", 0, "Time to stay in preset2 position")
-	flag.IntVar(&c.port, "port", 0, "Port to serve http metrics and api")
-	flag.BoolVar(&c.detectDisplay, "detect-display", false, "Detect display status and don't automatically move desk when display is asleep")
+	flag.StringVar(&c.deviceAddress, "device", "", "Address of bluetooth device to connect to.\nUse the --scan option to print out nearby devices the first time")
+	flag.BoolVar(&c.auto, "auto", true, "Automatically move desk between presets throughout the day. Use --preset options to configure the timing.\nSpecify --auto=false to disable")
+	flag.DurationVar(&c.preset1Time, "preset1", 40*time.Minute, "Time to stay in preset1 position")
+	flag.DurationVar(&c.preset2Time, "preset2", 20*time.Minute, "Time to stay in preset2 position")
+	flag.IntVar(&c.port, "port", 9090, "Port to serve Prometheus http metrics.\nSpecify --port=0 to disable")
+	flag.BoolVar(&c.detectDisplay, "detect-display", true, "Detect display status and don't automatically move desk when display is asleep.\nSpecify --detect-display=false to disable")
+	flag.BoolVar(&c.detectExternalPower, "detect-external-power", true, "For laptops. Don't automatically move desk unless connected to external power.\nSpecify --detect-external-power=false to disable")
 }
 
 func main() {
@@ -138,14 +142,12 @@ func main() {
 		}()
 	}
 
-	if c.detectDisplay {
-		if err := supportsDisplayCheck(); err != nil {
-			fmt.Println("Display detection error:", err)
-		}
-		monitorDisplay()
+	err = backgroundChecks(c)
+	if err != nil {
+		fmt.Println(err)
 	}
 
-	if c.preset1Time > 0 && c.preset2Time > 0 {
+	if c.auto {
 		auto(desk, c)
 	}
 
@@ -235,6 +237,8 @@ func connect(address bluetooth.Address) (*desk, error) {
 }
 
 func auto(desk *desk, c *config) {
+	fmt.Println("Enabling auto desk control.")
+
 	go func() {
 		var (
 			dur     = c.preset1Time
@@ -242,16 +246,17 @@ func auto(desk *desk, c *config) {
 			t       = time.NewTimer(dur)
 		)
 
-		if !c.detectDisplay || awake {
+		if deskActive {
 			// Initialize first position
-			fmt.Println("Enabling auto desk control.")
 			fmt.Println("Going to preset 1 for", dur)
 			desk.command.WriteWithoutResponse(commandGoToPreset1)
+		} else {
+			fmt.Println("Skipping desk movement because:", deskActiveReason)
 		}
 
 		for range t.C {
-			if c.detectDisplay && !awake {
-				fmt.Println("Skipping desk movement because display is not awake")
+			if !deskActive {
+				fmt.Println("Skipping desk movement because:", deskActiveReason)
 				t.Reset(dur)
 				continue
 			}
@@ -292,6 +297,7 @@ func cli(desk *desk, c *config) {
 			desk.command.WriteWithoutResponse(commandLower)
 		default:
 			// Enter raw commands in the form of comma-delimited decimal notations
+			// Go to preset 1 by typing this and then enter
 			// 241,241,5,0,5,126
 			ints := strings.Split(command, ",")
 			bytes := []byte{}
