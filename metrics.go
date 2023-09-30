@@ -14,3 +14,8 @@ var metricsDeskHeightMeters = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "uplift_desk_height_meters",
 	Help: "Current desk height in meters",
 }, []string{"desk_addr"})
+
+var metricsDisplayOn = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "display_on",
+	Help: "Display status 1 = on",
+})

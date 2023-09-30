@@ -76,6 +76,7 @@ type config struct {
 	preset1Time   time.Duration
 	preset2Time   time.Duration
 	port          int
+	detectDisplay bool
 }
 
 func (c *config) registerFlagsAndApplyDefaults() {
@@ -84,6 +85,7 @@ func (c *config) registerFlagsAndApplyDefaults() {
 	flag.DurationVar(&c.preset1Time, "preset1", 0, "Time to stay in preset1 position")
 	flag.DurationVar(&c.preset2Time, "preset2", 0, "Time to stay in preset2 position")
 	flag.IntVar(&c.port, "port", 0, "Port to serve http metrics and api")
+	flag.BoolVar(&c.detectDisplay, "detect-display", false, "Detect display status and don't automatically move desk when display is asleep")
 }
 
 func main() {
@@ -134,6 +136,13 @@ func main() {
 		go func() {
 			http.ListenAndServe(addr, nil)
 		}()
+	}
+
+	if c.detectDisplay {
+		if err := supportsDisplayCheck(); err != nil {
+			fmt.Println("Display detection error:", err)
+		}
+		monitorDisplay()
 	}
 
 	if c.preset1Time > 0 && c.preset2Time > 0 {
@@ -233,11 +242,20 @@ func auto(desk *desk, c *config) {
 			t       = time.NewTimer(dur)
 		)
 
-		fmt.Println("Enabling auto desk control.")
-		fmt.Println("Going to preset 1 for", dur)
-		desk.command.WriteWithoutResponse(commandGoToPreset1)
+		if !c.detectDisplay || awake {
+			// Initialize first position
+			fmt.Println("Enabling auto desk control.")
+			fmt.Println("Going to preset 1 for", dur)
+			desk.command.WriteWithoutResponse(commandGoToPreset1)
+		}
 
 		for range t.C {
+			if c.detectDisplay && !awake {
+				fmt.Println("Skipping desk movement because display is not awake")
+				t.Reset(dur)
+				continue
+			}
+
 			switch dur {
 			case c.preset1Time:
 				fmt.Println("Going to preset 2 for", nextDur)
