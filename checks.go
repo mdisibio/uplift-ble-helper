@@ -55,6 +55,7 @@ func backgroundChecks(c *config) error {
 		}
 
 		deskActive = active
+		metricsDeskActive.Reset()
 		if deskActive {
 			metricsDeskActive.WithLabelValues("").Set(1)
 		} else {
